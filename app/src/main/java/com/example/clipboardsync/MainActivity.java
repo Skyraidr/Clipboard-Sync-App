@@ -28,6 +28,7 @@ import android.widget.Toast;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
+import android.app.AlertDialog;
 
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
@@ -47,6 +48,7 @@ import java.util.Enumeration;
 import java.util.HashSet;
 import java.util.Locale;
 import java.util.Set;
+
 
 public class MainActivity extends AppCompatActivity {
 
@@ -304,6 +306,11 @@ public class MainActivity extends AppCompatActivity {
             LinearLayout.LayoutParams checkParams = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1);
             checkBox.setLayoutParams(checkParams);
 
+            // --- ADDED: Edit Button ---
+            Button editBtn = new Button(this);
+            editBtn.setText("✎"); // Edit Icon/Text
+            editBtn.setOnClickListener(v -> showEditDeviceDialog(index));
+
             Button delBtn = new Button(this);
             delBtn.setText("X");
             delBtn.setTextColor(Color.RED);
@@ -314,9 +321,57 @@ public class MainActivity extends AppCompatActivity {
             });
 
             row.addView(checkBox);
+            row.addView(editBtn); // --- ADDED ---
             row.addView(delBtn);
             deviceListLayout.addView(row);
         }
+    }
+
+    private void showEditDeviceDialog(int index) {
+        DeviceInfo device = savedDevices.get(index);
+
+        android.app.AlertDialog.Builder builder = new android.app.AlertDialog.Builder(this);
+        builder.setTitle("Edit Device");
+
+        // Set up the layout for the dialog
+        LinearLayout layout = new LinearLayout(this);
+        layout.setOrientation(LinearLayout.VERTICAL);
+        int padding = dpToPx(20);
+        layout.setPadding(padding, padding, padding, padding);
+
+        // Input for Name
+        final EditText nameInput = new EditText(this);
+        nameInput.setText(device.name);
+        nameInput.setHint("Device Name");
+        layout.addView(nameInput);
+
+        // Input for IP
+        final EditText ipInput = new EditText(this);
+        ipInput.setText(device.ip);
+        ipInput.setHint("IP Address");
+        layout.addView(ipInput);
+
+        builder.setView(layout);
+
+        // Save button logic
+        builder.setPositiveButton("Save", (dialog, which) -> {
+            String newName = nameInput.getText().toString().trim();
+            String newIp = ipInput.getText().toString().trim();
+
+            if (!newName.isEmpty() && !newIp.isEmpty()) {
+                device.name = newName;
+                device.ip = newIp;
+                saveDevices();          // Save to SharedPreferences
+                refreshDeviceListUI();  // Update the UI
+            } else {
+                Toast.makeText(MainActivity.this, "Name and IP cannot be empty", Toast.LENGTH_SHORT).show();
+            }
+        });
+
+        // Cancel button logic
+        builder.setNegativeButton("Cancel", (dialog, which) -> dialog.cancel());
+
+        builder.show();
     }
 
     // --- RECEIVER LOGIC (MOBILE TO MOBILE) ---
