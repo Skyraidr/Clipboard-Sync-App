@@ -1,5 +1,10 @@
 package com.example.clipboardsync;
 
+import java.io.File;
+import java.nio.ByteBuffer;
+import android.provider.OpenableColumns;
+import android.os.Environment;
+import android.database.Cursor;
 import android.Manifest;
 import android.content.ClipData;
 import android.content.ClipboardManager;
@@ -211,6 +216,17 @@ public class MainActivity extends AppCompatActivity {
         layout.addView(createSpacer(dpToPx(10)));
         layout.addView(permissionBtn);
 
+        Button clearFilesBtn = new Button(this);
+        clearFilesBtn.setText("🗑️ CLEAR SAVED FILES");
+        clearFilesBtn.setLayoutParams(btnParams);
+        clearFilesBtn.setTextColor(Color.parseColor("#ff4444")); // Make it red so it stands out
+
+        clearFilesBtn.setOnClickListener(v -> clearAllSyncedFiles());
+
+// Add it to the layout (e.g., right above the permissionBtn)
+        layout.addView(createSpacer(dpToPx(10)));
+        layout.addView(clearFilesBtn);
+
         scrollView.addView(layout);
         setContentView(scrollView);
 
@@ -255,6 +271,51 @@ public class MainActivity extends AppCompatActivity {
         });
 
         handleIncomingIntent(getIntent());
+    }
+
+    private void clearAllSyncedFiles() {
+        new Thread(() -> {
+            int deletedCount = 0;
+
+            try {
+                // Android 10+ (API 29+) uses MediaStore Relative Paths
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    String selection = MediaStore.MediaColumns.RELATIVE_PATH + " LIKE ?";
+                    String[] selectionArgs = new String[]{"%ClipboardSync%"};
+
+                    // Delete from all media collections
+                    deletedCount += getContentResolver().delete(MediaStore.Files.getContentUri("external"), selection, selectionArgs);
+                } else {
+                    // Fallback for Android 9 and below: Delete via raw File API
+                    File downloadsDir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "ClipboardSync");
+                    File picturesDir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "ClipboardSync");
+                    File moviesDir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES), "ClipboardSync");
+
+                    File[] dirs = {downloadsDir, picturesDir, moviesDir};
+                    for (File dir : dirs) {
+                        if (dir.exists() && dir.isDirectory()) {
+                            File[] files = dir.listFiles();
+                            if (files != null) {
+                                for (File f : files) {
+                                    if (f.delete()) deletedCount++;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                final int finalCount = deletedCount;
+                new Handler(Looper.getMainLooper()).post(() ->
+                        Toast.makeText(MainActivity.this, "Cleared " + finalCount + " synced files", Toast.LENGTH_SHORT).show()
+                );
+
+            } catch (Exception e) {
+                e.printStackTrace();
+                new Handler(Looper.getMainLooper()).post(() ->
+                        Toast.makeText(MainActivity.this, "Error clearing files: " + e.getMessage(), Toast.LENGTH_SHORT).show()
+                );
+            }
+        }).start();
     }
 
     private void checkStoragePermissions() {
@@ -439,20 +500,37 @@ public class MainActivity extends AppCompatActivity {
                     Toast.makeText(this, "Received Text!", Toast.LENGTH_SHORT).show();
                 });
             }
-            else if (type == 2 || type == 3) { // Image or Video
-                // Perform heavy I/O (cleanup and save) here, NOT on the main thread
+            else if (type == 2 || type == 3 || type == 4) {
                 cleanupOldMedia();
-                Uri itemUri = saveMediaToStore(type, buffer);
+                Uri itemUri;
+
+                if (type == 4) {
+                    // Parse File Name and Content
+                    ByteBuffer bufferWrapper = ByteBuffer.wrap(buffer);
+                    int nameLen = bufferWrapper.getInt();
+                    byte[] nameBytes = new byte[nameLen];
+                    bufferWrapper.get(nameBytes);
+                    String fileName = new String(nameBytes);
+
+                    byte[] fileBytes = new byte[buffer.length - 4 - nameLen];
+                    bufferWrapper.get(fileBytes);
+
+                    itemUri = saveFileToDownloads(fileName, fileBytes);
+                } else {
+                    itemUri = saveMediaToStore(type, buffer); // Your existing Image/Video logic
+                }
 
                 if (itemUri != null) {
                     new Handler(Looper.getMainLooper()).post(() -> {
                         updateStatus(type);
-                        String mime = (type == 3) ? "video/mp4" : "image/png";
+                        String mime = "*/*";
+                        if (type == 3) mime = "video/mp4";
+                        if (type == 2) mime = "image/png";
+
                         ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
-                        ClipData.Item clipItem = new ClipData.Item(itemUri);
-                        ClipData clip = new ClipData("Sync Media", new String[]{mime}, clipItem);
+                        ClipData clip = new ClipData("Sync Media", new String[]{mime}, new ClipData.Item(itemUri));
                         cm.setPrimaryClip(clip);
-                        Toast.makeText(this, "Media Synced & Copied!", Toast.LENGTH_LONG).show();
+                        Toast.makeText(this, (type == 4 ? "File" : "Media") + " Synced & Copied!", Toast.LENGTH_LONG).show();
                     });
                 }
             }
@@ -462,6 +540,39 @@ public class MainActivity extends AppCompatActivity {
                     Toast.makeText(this, "Receive Error: " + e.getMessage(), Toast.LENGTH_SHORT).show()
             );
         }
+    }
+
+    private Uri saveFileToDownloads(String fileName, byte[] buffer) {
+        try {
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.MediaColumns.DISPLAY_NAME, fileName);
+            values.put(MediaStore.MediaColumns.MIME_TYPE, "application/octet-stream");
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                values.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/ClipboardSync");
+                values.put(MediaStore.MediaColumns.IS_PENDING, 1);
+            }
+
+            // Save to Downloads
+            Uri collection = MediaStore.Downloads.EXTERNAL_CONTENT_URI;
+            Uri itemUri = getContentResolver().insert(collection, values);
+
+            if (itemUri != null) {
+                try (OutputStream out = getContentResolver().openOutputStream(itemUri)) {
+                    if (out != null) out.write(buffer);
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    values.clear();
+                    values.put(MediaStore.MediaColumns.IS_PENDING, 0);
+                    getContentResolver().update(itemUri, values, null, null);
+                }
+                prefs.edit().putString("LastSyncUri", itemUri.toString()).apply();
+                return itemUri;
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return null;
     }
 
     private Uri saveMediaToStore(int type, byte[] buffer) {
@@ -633,9 +744,27 @@ public class MainActivity extends AppCompatActivity {
                 } else if (item.getUri() != null) {
                     Uri uri = item.getUri();
                     String mimeType = getContentResolver().getType(uri);
-                    if (mimeType != null && mimeType.startsWith("video/")) type = 3;
-                    else type = 2;
-                    data = getBytesFromUri(uri);
+                    byte[] fileBytes = getBytesFromUri(uri);
+
+                    if (fileBytes != null) {
+                        if (mimeType != null && mimeType.startsWith("video/")) {
+                            sendToAllDevices(3, fileBytes);
+                        } else if (mimeType != null && mimeType.startsWith("image/")) {
+                            sendToAllDevices(2, fileBytes);
+                        } else {
+                            // TYPE 4: Generic File (PDF, ZIP, DOCX)
+                            String fileName = getFileNameFromUri(uri);
+                            if (fileName == null) fileName = "sync_file_" + System.currentTimeMillis();
+
+                            byte[] nameBytes = fileName.getBytes("UTF-8");
+                            ByteBuffer buffer = ByteBuffer.allocate(4 + nameBytes.length + fileBytes.length);
+                            buffer.putInt(nameBytes.length);
+                            buffer.put(nameBytes);
+                            buffer.put(fileBytes);
+
+                            sendToAllDevices(4, buffer.array());
+                        }
+                    }
                 }
 
                 if (data != null) {
@@ -692,5 +821,23 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception e) {
             return null;
         }
+    }
+
+    private String getFileNameFromUri(Uri uri) {
+        String result = null;
+        if (uri.getScheme().equals("content")) {
+            try (Cursor cursor = getContentResolver().query(uri, null, null, null, null)) {
+                if (cursor != null && cursor.moveToFirst()) {
+                    int index = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME);
+                    if (index != -1) result = cursor.getString(index);
+                }
+            }
+        }
+        if (result == null) {
+            result = uri.getPath();
+            int cut = result.lastIndexOf('/');
+            if (cut != -1) result = result.substring(cut + 1);
+        }
+        return result;
     }
 }
