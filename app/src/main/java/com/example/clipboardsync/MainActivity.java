@@ -691,32 +691,73 @@ public class MainActivity extends AppCompatActivity {
             return;
         }
 
-        // Share Menu
-        if (Intent.ACTION_SEND.equals(action) && type != null) {
-            if (savedDevices.isEmpty()) {
-                Toast.makeText(getApplicationContext(), "Add a device in the app first!", Toast.LENGTH_LONG).show();
-                return;
-            }
+        if (savedDevices.isEmpty()) {
+            Toast.makeText(getApplicationContext(), "Add a device in the app first!", Toast.LENGTH_LONG).show();
+            return;
+        }
 
+        // --- SINGLE FILE SHARE ---
+        if (Intent.ACTION_SEND.equals(action) && type != null) {
             if ("text/plain".equals(type)) {
                 String sharedText = intent.getStringExtra(Intent.EXTRA_TEXT);
                 if (sharedText != null) {
                     Toast.makeText(getApplicationContext(), "Sending text...", Toast.LENGTH_SHORT).show();
                     sendToAllDevices(1, sharedText.getBytes());
                 }
-            }
-            else if (type.startsWith("image/") || type.startsWith("video/")) {
+            } else {
                 Uri fileUri = intent.getParcelableExtra(Intent.EXTRA_STREAM);
                 if (fileUri != null) {
-                    int sendType = type.startsWith("video/") ? 3 : 2;
-                    Toast.makeText(getApplicationContext(), "Sending media...", Toast.LENGTH_SHORT).show();
-                    new Thread(() -> {
-                        byte[] data = getBytesFromUri(fileUri);
-                        if (data != null) sendToAllDevices(sendType, data);
-                    }).start();
+                    Toast.makeText(getApplicationContext(), "Sending file...", Toast.LENGTH_SHORT).show();
+                    processAndSendUri(fileUri, type);
                 }
             }
         }
+
+        // --- MULTIPLE FILE SHARE ---
+        else if (Intent.ACTION_SEND_MULTIPLE.equals(action) && type != null) {
+            ArrayList<Uri> imageUris = intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
+            if (imageUris != null) {
+                Toast.makeText(getApplicationContext(), "Sending " + imageUris.size() + " files...", Toast.LENGTH_SHORT).show();
+                for (Uri fileUri : imageUris) {
+                    processAndSendUri(fileUri, type);
+                }
+            }
+        }
+    }
+
+    // Helper method to keep things clean
+    private void processAndSendUri(Uri fileUri, String mimeType) {
+        new Thread(() -> {
+            byte[] fileBytes = getBytesFromUri(fileUri);
+            if (fileBytes != null) {
+                int sendType = 4; // Default to Generic File
+
+                // If it's explicitly an image or video, use those types.
+                // Otherwise, it gets sent as a Type 4 Generic File (like a PDF).
+                if (mimeType != null) {
+                    if (mimeType.startsWith("video/")) sendType = 3;
+                    else if (mimeType.startsWith("image/")) sendType = 2;
+                }
+
+                if (sendType == 4) {
+                    String fileName = getFileNameFromUri(fileUri);
+                    if (fileName == null) fileName = "sync_file_" + System.currentTimeMillis();
+
+                    try {
+                        byte[] nameBytes = fileName.getBytes("UTF-8");
+                        ByteBuffer buffer = ByteBuffer.allocate(4 + nameBytes.length + fileBytes.length);
+                        buffer.putInt(nameBytes.length);
+                        buffer.put(nameBytes);
+                        buffer.put(fileBytes);
+                        sendToAllDevices(4, buffer.array());
+                    } catch (Exception e) {
+                        e.printStackTrace();
+                    }
+                } else {
+                    sendToAllDevices(sendType, fileBytes);
+                }
+            }
+        }).start();
     }
 
     private void performManualSync() {
