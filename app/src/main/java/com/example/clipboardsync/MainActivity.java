@@ -743,6 +743,12 @@ public class MainActivity extends AppCompatActivity {
                     String fileName = getFileNameFromUri(fileUri);
                     if (fileName == null) fileName = "sync_file_" + System.currentTimeMillis();
 
+                    // ---> ADD THIS CHECK <---
+                    // Ensure PDFs generated on-the-fly by Samsung Notes get the right extension
+                    if (mimeType != null && mimeType.equals("application/pdf") && !fileName.toLowerCase().endsWith(".pdf")) {
+                        fileName += ".pdf";
+                    }
+
                     try {
                         byte[] nameBytes = fileName.getBytes("UTF-8");
                         ByteBuffer buffer = ByteBuffer.allocate(4 + nameBytes.length + fileBytes.length);
