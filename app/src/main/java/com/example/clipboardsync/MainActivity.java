@@ -65,8 +65,7 @@ public class MainActivity extends AppCompatActivity {
     private LinearLayout deviceListLayout;
 
     private Button manualSendBtn;
-    private Button floatingBtn;
-    private Button permissionBtn;
+
     private SharedPreferences prefs;
 
     private ArrayList<DeviceInfo> savedDevices = new ArrayList<>();
@@ -193,13 +192,7 @@ public class MainActivity extends AppCompatActivity {
         manualSendBtn.setText("📤 SEND TO SELECTED DEVICES");
         manualSendBtn.setLayoutParams(btnParams);
 
-        floatingBtn = new Button(this);
-        floatingBtn.setText("🔵 Enable Floating Button");
-        floatingBtn.setLayoutParams(btnParams);
 
-        permissionBtn = new Button(this);
-        permissionBtn.setText("Allow Display Over Apps (Required)");
-        permissionBtn.setLayoutParams(btnParams);
 
         layout.addView(title);
         layout.addView(statusTextView);
@@ -212,9 +205,7 @@ public class MainActivity extends AppCompatActivity {
         layout.addView(createSpacer(dpToPx(20)));
         layout.addView(manualSendBtn);
         layout.addView(createSpacer(dpToPx(10)));
-        layout.addView(floatingBtn);
-        layout.addView(createSpacer(dpToPx(10)));
-        layout.addView(permissionBtn);
+
 
         Button clearFilesBtn = new Button(this);
         clearFilesBtn.setText("🗑️ CLEAR SAVED FILES");
@@ -250,25 +241,9 @@ public class MainActivity extends AppCompatActivity {
 
         manualSendBtn.setOnClickListener(v -> performManualSync());
 
-        permissionBtn.setOnClickListener(v -> {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-                if (!Settings.canDrawOverlays(this)) {
-                    Intent settingsIntent = new Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                            Uri.parse("package:" + getPackageName()));
-                    startActivity(settingsIntent);
-                }
-            }
-        });
 
-        floatingBtn.setOnClickListener(v -> {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(this)) {
-                Toast.makeText(this, "Permission Required!", Toast.LENGTH_SHORT).show();
-                return;
-            }
-            Intent serviceIntent = new Intent(MainActivity.this, FloatingButtonService.class);
-            startService(serviceIntent);
-            moveTaskToBack(true);
-        });
+
+
 
         handleIncomingIntent(getIntent());
     }
@@ -650,23 +625,9 @@ public class MainActivity extends AppCompatActivity {
         return view;
     }
 
-    @Override
-    protected void onResume() {
-        super.onResume();
-        updatePermissionUI();
-    }
 
-    private void updatePermissionUI() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            if (Settings.canDrawOverlays(this)) {
-                permissionBtn.setText("Display Over Apps: GRANTED ✅");
-                permissionBtn.setTextColor(Color.GREEN);
-            } else {
-                permissionBtn.setText("Allow Display Over Apps (Required) ❌");
-                permissionBtn.setTextColor(Color.RED);
-            }
-        }
-    }
+
+
 
     @Override
     protected void onNewIntent(Intent intent) {
@@ -685,24 +646,26 @@ public class MainActivity extends AppCompatActivity {
         String action = intent.getAction();
         String type = intent.getType();
 
-        // Auto Send (Floating Button)
-        if (intent.getBooleanExtra("AUTO_SEND", false)) {
-            new Handler(Looper.getMainLooper()).postDelayed(this::performManualSync, 500);
-            return;
-        }
-
         if (savedDevices.isEmpty()) {
             Toast.makeText(getApplicationContext(), "Add a device in the app first!", Toast.LENGTH_LONG).show();
             return;
         }
 
-        // --- SINGLE FILE SHARE ---
+        // --- SINGLE FILE/TEXT SHARE ---
         if (Intent.ACTION_SEND.equals(action) && type != null) {
             if ("text/plain".equals(type)) {
                 String sharedText = intent.getStringExtra(Intent.EXTRA_TEXT);
                 if (sharedText != null) {
                     Toast.makeText(getApplicationContext(), "Sending text...", Toast.LENGTH_SHORT).show();
-                    sendToAllDevices(1, sharedText.getBytes());
+
+                    // FIX: Wrap network call in a background thread!
+                    new Thread(() -> {
+                        try {
+                            sendToAllDevices(1, sharedText.getBytes("UTF-8"));
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                        }
+                    }).start();
                 }
             } else {
                 Uri fileUri = intent.getParcelableExtra(Intent.EXTRA_STREAM);
