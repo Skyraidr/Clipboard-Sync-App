@@ -19,6 +19,7 @@ import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.MediaStore;
 import android.provider.Settings;
 import android.view.Gravity;
@@ -30,7 +31,10 @@ import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
+import androidx.activity.result.ActivityResultLauncher;
+import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import android.app.AlertDialog;
@@ -38,11 +42,13 @@ import android.app.AlertDialog;
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Inet4Address;
 import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.NetworkInterface;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -51,8 +57,10 @@ import java.util.ArrayList;
 import java.util.Date;
 import java.util.Enumeration;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 
 public class MainActivity extends AppCompatActivity {
@@ -68,9 +76,29 @@ public class MainActivity extends AppCompatActivity {
 
     private SharedPreferences prefs;
 
-    private ArrayList<DeviceInfo> savedDevices = new ArrayList<>();
+    // Thread-safe: read by background send threads while the UI may add/remove devices
+    private final List<DeviceInfo> savedDevices = new CopyOnWriteArrayList<>();
     private ServerSocket serverSocket;
     private boolean isServerRunning = false;
+
+    // --- QR PAIRING ---
+    private static final int TYPE_PAIR = 5;      // Phone -> Desktop: "I scanned your QR code". Data = phone name
+    private static final int TYPE_PAIR_ACK = 6;  // Desktop -> Phone: "I can reach you too". Data = desktop name
+
+    // Static because the receiver server may be running on an earlier instance of this activity
+    private static volatile MainActivity liveInstance;
+    private static volatile long lastPairAckTime = 0;
+
+    private final ActivityResultLauncher<Intent> qrScanLauncher =
+            registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
+                if (result.getResultCode() != RESULT_OK || result.getData() == null) return;
+                PairingQr.Info info = PairingQr.parse(result.getData().getStringExtra(QrScanActivity.EXTRA_QR_PAYLOAD));
+                if (info == null) {
+                    Toast.makeText(this, "Not a Clipboard Sync QR code", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+                connectToDesktop(info);
+            });
 
     private static class DeviceInfo {
         String name;
@@ -143,6 +171,15 @@ public class MainActivity extends AppCompatActivity {
         myIpTextView.setPadding(0, 0, 0, dpToPx(24));
         myIpTextView.setOnClickListener(v -> myIpTextView.setText("My IP: " + getLocalIpAddress()));
 
+        // --- QR PAIRING ---
+        Button scanQrBtn = new Button(this);
+        scanQrBtn.setText("📷 SCAN DESKTOP QR CODE");
+        scanQrBtn.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        ));
+        scanQrBtn.setOnClickListener(v -> qrScanLauncher.launch(new Intent(this, QrScanActivity.class)));
+
         // --- ADD DEVICE SECTION ---
         TextView addLabel = new TextView(this);
         addLabel.setText("Add Target Device:");
@@ -197,6 +234,8 @@ public class MainActivity extends AppCompatActivity {
         layout.addView(title);
         layout.addView(statusTextView);
         layout.addView(myIpTextView);
+        layout.addView(scanQrBtn);
+        layout.addView(createSpacer(dpToPx(20)));
         layout.addView(addLabel);
         layout.addView(addLayout);
         layout.addView(listLabel);
@@ -220,6 +259,12 @@ public class MainActivity extends AppCompatActivity {
 
         scrollView.addView(layout);
         setContentView(scrollView);
+        liveInstance = this;
+
+        // Warm up CameraX in the background so the QR scanner opens instantly
+        try {
+            ProcessCameraProvider.getInstance(getApplicationContext());
+        } catch (Exception ignored) { }
 
         // --- LISTENERS ---
 
@@ -419,6 +464,7 @@ public class MainActivity extends AppCompatActivity {
                 isServerRunning = true;
 
                 new Handler(Looper.getMainLooper()).post(() -> {
+                    if (statusTextView == null) return; // Started from a share, no UI
                     statusTextView.setText("Receiver Status: Ready (Listening on Port 8888)");
                     statusTextView.setTextColor(Color.GREEN);
                 });
@@ -434,6 +480,7 @@ public class MainActivity extends AppCompatActivity {
             } catch (IOException e) {
                 e.printStackTrace();
                 new Handler(Looper.getMainLooper()).post(() -> {
+                    if (statusTextView == null) return; // Started from a share, no UI
                     statusTextView.setText("Receiver Status: Error (Port 8888 Busy)");
                     statusTextView.setTextColor(Color.RED);
                 });
@@ -460,13 +507,28 @@ public class MainActivity extends AppCompatActivity {
         try (Socket socket = client;
              DataInputStream in = new DataInputStream(socket.getInputStream())) {
 
-            int type = in.readInt();
+            int type;
+            try {
+                type = in.readInt();
+            } catch (EOFException probe) {
+                // Connected and closed without data (e.g. the desktop's network scan) - nothing to do
+                return;
+            }
             int length = in.readInt();
             byte[] buffer = new byte[length];
             in.readFully(buffer);
 
             // Process data (Background Thread)
-            if (type == 1) { // Text
+            if (type == TYPE_PAIR_ACK) { // Desktop confirmed it can reach us -> connected both ways
+                String desktopName = new String(buffer, "UTF-8");
+                lastPairAckTime = SystemClock.elapsedRealtime();
+                new Handler(Looper.getMainLooper()).post(() -> {
+                    MainActivity live = liveInstance;
+                    if (live != null) live.showPairConfirmed(desktopName);
+                    else Toast.makeText(getApplicationContext(), "Connected both ways with " + desktopName, Toast.LENGTH_SHORT).show();
+                });
+            }
+            else if (type == 1) { // Text
                 String text = new String(buffer);
                 new Handler(Looper.getMainLooper()).post(() -> {
                     updateStatus(type);
@@ -592,6 +654,7 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void updateStatus(int type) {
+        if (statusTextView == null) return;
         String time = new SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(new Date());
         statusTextView.setText("Last Received: " + (type==1?"Text":"File") + " at " + time);
         statusTextView.setTextColor(Color.CYAN);
@@ -610,6 +673,161 @@ public class MainActivity extends AppCompatActivity {
             }
         } catch (Exception ex) { ex.printStackTrace(); }
         return "Unavailable";
+    }
+
+    // --- QR PAIRING ---
+
+    // Tells the desktop who we are. Once the desktop receives this it sends to this phone,
+    // and the desktop is saved here as a target, so clipboard sync works in both directions.
+    private void connectToDesktop(PairingQr.Info info) {
+        final String phoneName = getPhoneName();
+        final List<String> tryOrder = PairingQr.prioritizeSameSubnet(info.ips, getAllLocalIpv4());
+        final long pairStartedAt = SystemClock.elapsedRealtime();
+
+        if (statusTextView != null) {
+            statusTextView.setText("Connecting to " + info.desktopName + "...");
+            statusTextView.setTextColor(Color.YELLOW);
+        }
+
+        new Thread(() -> {
+            String connectedIp = null;
+            String lastError = null;
+            for (String ip : tryOrder) {
+                try (Socket socket = new Socket()) {
+                    socket.connect(new InetSocketAddress(ip, PairingQr.PORT), 1500);
+                    DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+                    byte[] nameBytes = phoneName.getBytes("UTF-8");
+                    out.writeInt(TYPE_PAIR);
+                    out.writeInt(nameBytes.length);
+                    out.write(nameBytes);
+                    out.flush();
+                    connectedIp = ip;
+                    break;
+                } catch (Exception e) {
+                    lastError = e.getMessage();
+                }
+            }
+
+            final String ip = connectedIp;
+            final String error = lastError;
+            new Handler(Looper.getMainLooper()).post(() -> {
+                if (ip != null) onPaired(info.desktopName, ip, pairStartedAt);
+                else showPairingFailed(info, error);
+            });
+        }).start();
+    }
+
+    private void onPaired(String desktopName, String ip, long pairStartedAt) {
+        addOrUpdateDevice(desktopName, ip);
+
+        if (lastPairAckTime >= pairStartedAt) {
+            // The desktop's confirmation already arrived
+            showPairConfirmed(desktopName);
+        } else {
+            if (statusTextView != null) {
+                statusTextView.setText("Connected to " + desktopName + " - confirming...");
+                statusTextView.setTextColor(Color.YELLOW);
+            }
+            Toast.makeText(this, "Connected to " + desktopName, Toast.LENGTH_SHORT).show();
+        }
+
+        // If the desktop can't reach us back, sync would only work one way - tell the user why
+        new Handler(Looper.getMainLooper()).postDelayed(() -> {
+            if (lastPairAckTime >= pairStartedAt) return;
+            MainActivity live = liveInstance;
+            if (live == null || live.isFinishing() || live.isDestroyed()) return;
+            if (live.statusTextView != null) {
+                live.statusTextView.setText("Connected to " + desktopName + " (one way only)");
+                live.statusTextView.setTextColor(Color.parseColor("#FFA500"));
+            }
+            new AlertDialog.Builder(live)
+                    .setTitle("Almost connected")
+                    .setMessage("This phone can send to " + desktopName + ", but " + desktopName
+                            + " could not reach this phone.\n\n"
+                            + "• Keep Clipboard Sync open on this phone\n"
+                            + "• Make sure both devices are on the same Wi-Fi\n"
+                            + "• Some guest/public Wi-Fi networks block device-to-device traffic")
+                    .setPositiveButton("OK", null)
+                    .show();
+        }, 5000);
+    }
+
+    private void showPairConfirmed(String desktopName) {
+        if (statusTextView != null) {
+            statusTextView.setText("✅ Connected both ways with " + desktopName);
+            statusTextView.setTextColor(Color.GREEN);
+        }
+        Toast.makeText(this, "Connected both ways with " + desktopName + "!", Toast.LENGTH_SHORT).show();
+    }
+
+    private void showPairingFailed(PairingQr.Info info, String error) {
+        if (statusTextView != null) {
+            statusTextView.setText("Could not connect to " + info.desktopName);
+            statusTextView.setTextColor(Color.RED);
+        }
+        if (isFinishing() || isDestroyed()) return;
+        new AlertDialog.Builder(this)
+                .setTitle("Could not connect")
+                .setMessage("Could not reach " + info.desktopName + " at " + String.join(", ", info.ips)
+                        + (error != null ? "\n\n(" + error + ")" : "") + "\n\n"
+                        + "• Make sure the desktop app is running\n"
+                        + "• Connect both devices to the same Wi-Fi\n"
+                        + "• Allow Java through the PC's firewall (port 8888)")
+                .setPositiveButton("OK", null)
+                .show();
+    }
+
+    // Saves the desktop as a send target (updating it instead of adding a duplicate)
+    private void addOrUpdateDevice(String name, String ip) {
+        DeviceInfo match = null;
+        for (DeviceInfo d : savedDevices) {
+            if (d.ip.equals(ip)) { match = d; break; } // Same address: keep the user's name for it
+        }
+        if (match == null) {
+            for (DeviceInfo d : savedDevices) {
+                if (d.name.equalsIgnoreCase(name)) { // Same desktop, new address (e.g. DHCP changed it)
+                    match = d;
+                    match.ip = ip;
+                    break;
+                }
+            }
+        }
+        if (match != null) {
+            match.selected = true;
+        } else {
+            savedDevices.add(new DeviceInfo(name, ip));
+        }
+        saveDevices();
+        if (deviceListLayout != null) refreshDeviceListUI();
+    }
+
+    private String getPhoneName() {
+        String name = null;
+        try {
+            name = Settings.Global.getString(getContentResolver(), Settings.Global.DEVICE_NAME);
+        } catch (Exception ignored) { }
+        if (name == null || name.trim().isEmpty()) name = Build.MANUFACTURER + " " + Build.MODEL;
+        return name.trim();
+    }
+
+    private List<String> getAllLocalIpv4() {
+        List<String> result = new ArrayList<>();
+        try {
+            for (Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces(); en != null && en.hasMoreElements();) {
+                NetworkInterface intf = en.nextElement();
+                for (Enumeration<InetAddress> addrs = intf.getInetAddresses(); addrs.hasMoreElements();) {
+                    InetAddress addr = addrs.nextElement();
+                    if (!addr.isLoopbackAddress() && addr instanceof Inet4Address) result.add(addr.getHostAddress());
+                }
+            }
+        } catch (Exception ignored) { }
+        return result;
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        if (liveInstance == this) liveInstance = null;
     }
 
     // --- SHARED HELPER METHODS ---
@@ -647,7 +865,7 @@ public class MainActivity extends AppCompatActivity {
         String type = intent.getType();
 
         if (savedDevices.isEmpty()) {
-            Toast.makeText(getApplicationContext(), "Add a device in the app first!", Toast.LENGTH_LONG).show();
+            Toast.makeText(getApplicationContext(), "Add a device (or scan your desktop's QR code) in the app first!", Toast.LENGTH_LONG).show();
             return;
         }
 
