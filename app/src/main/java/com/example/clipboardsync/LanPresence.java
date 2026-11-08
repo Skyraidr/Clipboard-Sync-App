@@ -200,10 +200,14 @@ final class LanPresence {
         } catch (Exception ignored) { }
         try {
             targets.add(InetAddress.getByName("255.255.255.255"));
-            for (String ip : listener.knownDesktopIps()) {
-                targets.add(InetAddress.getByName(ip)); // IP literals: no DNS lookup
-            }
         } catch (Exception ignored) { }
+        for (String ip : listener.knownDesktopIps()) {
+            // Only plain IPv4 addresses (a typed hostname would mean a DNS lookup on every announcement)
+            if (!PairingQr.isValidIpv4(ip)) continue;
+            try {
+                targets.add(InetAddress.getByName(ip));
+            } catch (Exception ignored) { }
+        }
 
         for (InetAddress target : targets) {
             try {
