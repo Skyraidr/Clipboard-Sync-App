@@ -23,6 +23,13 @@ public class PairingQrTest {
     }
 
     @Test
+    public void readsDesktopIdWhenPresent() {
+        assertEquals("076c24fa828f", PairingQr.parse("clipsync://pair?v=1&n=PC&id=076c24fa828f&ip=192.168.1.2").desktopId);
+        assertNull(PairingQr.parse("clipsync://pair?v=1&n=PC&ip=192.168.1.2").desktopId);
+        assertNull(PairingQr.parse("clipsync://pair?v=1&n=PC&id=bad%20id&ip=192.168.1.2").desktopId);
+    }
+
+    @Test
     public void decodesUnicodeAndPlusInName() {
         PairingQr.Info info = PairingQr.parse("clipsync://pair?v=1&n=Caf%C3%A9+PC&ip=192.168.0.2");
         assertNotNull(info);

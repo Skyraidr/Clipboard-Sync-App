@@ -8,7 +8,8 @@ import java.util.List;
 /**
  * Parses the pairing QR code shown by the Clipboard Sync desktop app.
  *
- * Format: clipsync://pair?v=1&n=<url-encoded desktop name>&ip=<ip1>,<ip2>,...
+ * Format: clipsync://pair?v=1&n=<url-encoded desktop name>&id=<desktop id>&ip=<ip1>,<ip2>,...
+ * (id is optional: desktops without auto-reconnect don't send it)
  *
  * Plain Java (no Android classes) so it can be used from the camera thread and unit tested.
  */
@@ -21,10 +22,12 @@ public final class PairingQr {
 
     public static final class Info {
         public final String desktopName;
+        public final String desktopId; // null if the desktop didn't include one
         public final List<String> ips;
 
-        Info(String desktopName, List<String> ips) {
+        Info(String desktopName, String desktopId, List<String> ips) {
             this.desktopName = desktopName;
+            this.desktopId = desktopId;
             this.ips = ips;
         }
     }
@@ -41,6 +44,7 @@ public final class PairingQr {
         }
 
         String name = null;
+        String id = null;
         List<String> ips = new ArrayList<>();
         for (String param : s.substring(prefixLen + 1).split("&")) {
             int eq = param.indexOf('=');
@@ -51,6 +55,8 @@ public final class PairingQr {
 
             if (key.equals("n")) {
                 name = value;
+            } else if (key.equals("id")) {
+                id = DeviceInfo.isValidId(value) ? value : null;
             } else if (key.equals("ip")) {
                 for (String ip : value.split(",")) {
                     ip = ip.trim();
@@ -59,7 +65,7 @@ public final class PairingQr {
             }
         }
         if (ips.isEmpty()) return null;
-        return new Info(cleanName(name), Collections.unmodifiableList(ips));
+        return new Info(cleanName(name), id, Collections.unmodifiableList(ips));
     }
 
     /**

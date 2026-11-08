@@ -74,6 +74,7 @@ public class MainActivity extends AppCompatActivity {
 
     private Button manualSendBtn;
 
+    private static final String PREFS_NAME = "AppPrefs";
     private SharedPreferences prefs;
 
     // Thread-safe: read by background send threads while the UI may add/remove devices
@@ -89,6 +90,36 @@ public class MainActivity extends AppCompatActivity {
     private static volatile MainActivity liveInstance;
     private static volatile long lastPairAckTime = 0;
 
+    // --- AUTO-RECONNECT ---
+    // Application context (safe to keep statically) for presence updates while no screen is open
+    private static Context appContext;
+
+    private static final LanPresence.Listener PRESENCE_LISTENER = new LanPresence.Listener() {
+        @Override
+        public void onDesktopSeen(String id, String name, String ip) {
+            new Handler(Looper.getMainLooper()).post(() -> handleDesktopSeen(id, name, ip));
+        }
+
+        @Override
+        public void onLocalAddressesChanged() {
+            new Handler(Looper.getMainLooper()).post(() -> {
+                MainActivity live = liveInstance;
+                if (live != null && live.myIpTextView != null) {
+                    live.myIpTextView.setText("My IP: " + live.getLocalIpAddress());
+                }
+            });
+        }
+
+        @Override
+        public List<String> knownDesktopIps() {
+            List<String> ips = new ArrayList<>();
+            Context ctx = appContext;
+            if (ctx == null) return ips;
+            for (DeviceInfo d : loadDeviceList(ctx.getSharedPreferences(PREFS_NAME, MODE_PRIVATE))) ips.add(d.ip);
+            return ips;
+        }
+    };
+
     private final ActivityResultLauncher<Intent> qrScanLauncher =
             registerForActivityResult(new ActivityResultContracts.StartActivityForResult(), result -> {
                 if (result.getResultCode() != RESULT_OK || result.getData() == null) return;
@@ -100,28 +131,22 @@ public class MainActivity extends AppCompatActivity {
                 connectToDesktop(info);
             });
 
-    private static class DeviceInfo {
-        String name;
-        String ip;
-        boolean selected = true;
-
-        DeviceInfo(String name, String ip) {
-            this.name = name;
-            this.ip = ip;
-        }
-    }
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        prefs = getSharedPreferences("AppPrefs", MODE_PRIVATE);
+        prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         loadDevices();
 
         // Check for Write Permission on older Android versions
         checkStoragePermissions();
 
         startReceiverServer();
+
+        // Auto-reconnect: announce this phone and follow saved desktops to new IPs
+        appContext = getApplicationContext();
+        LanPresence.start(appContext, getOrCreateDeviceId(), getPhoneName(), PRESENCE_LISTENER);
 
         Intent intent = getIntent();
         if (intent != null && Intent.ACTION_SEND.equals(intent.getAction())) {
@@ -352,21 +377,29 @@ public class MainActivity extends AppCompatActivity {
 
     private void loadDevices() {
         savedDevices.clear();
-        Set<String> set = prefs.getStringSet("SavedDevicesList", new HashSet<>());
-        for (String s : set) {
-            String[] parts = s.split("\\|");
-            if (parts.length >= 2) {
-                savedDevices.add(new DeviceInfo(parts[0], parts[1]));
-            }
-        }
+        savedDevices.addAll(loadDeviceList(prefs));
     }
 
     private void saveDevices() {
-        Set<String> set = new HashSet<>();
-        for (DeviceInfo d : savedDevices) {
-            set.add(d.name + "|" + d.ip);
+        saveDeviceList(prefs, savedDevices);
+    }
+
+    private static List<DeviceInfo> loadDeviceList(SharedPreferences p) {
+        List<DeviceInfo> list = new ArrayList<>();
+        Set<String> set = p.getStringSet("SavedDevicesList", new HashSet<>());
+        for (String s : set) {
+            DeviceInfo d = DeviceInfo.parse(s);
+            if (d != null) list.add(d);
         }
-        prefs.edit().putStringSet("SavedDevicesList", set).apply();
+        return list;
+    }
+
+    private static void saveDeviceList(SharedPreferences p, List<DeviceInfo> devices) {
+        Set<String> set = new HashSet<>();
+        for (DeviceInfo d : devices) {
+            set.add(d.serialize());
+        }
+        p.edit().putStringSet("SavedDevicesList", set).apply();
     }
 
     private void refreshDeviceListUI() {
@@ -660,19 +693,24 @@ public class MainActivity extends AppCompatActivity {
         statusTextView.setTextColor(Color.CYAN);
     }
 
+    // Prefers the Wi-Fi/Ethernet address (the one desktops can reach) over mobile data
     private String getLocalIpAddress() {
+        String fallback = null;
         try {
-            for (Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces(); en.hasMoreElements();) {
+            for (Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces(); en != null && en.hasMoreElements();) {
                 NetworkInterface intf = en.nextElement();
+                String ifName = intf.getName() == null ? "" : intf.getName().toLowerCase(Locale.ROOT);
+                boolean lan = ifName.startsWith("wlan") || ifName.startsWith("eth") || ifName.startsWith("swlan") || ifName.startsWith("ap");
                 for (Enumeration<InetAddress> enumIpAddr = intf.getInetAddresses(); enumIpAddr.hasMoreElements();) {
                     InetAddress inetAddress = enumIpAddr.nextElement();
                     if (!inetAddress.isLoopbackAddress() && inetAddress instanceof Inet4Address) {
-                        return inetAddress.getHostAddress();
+                        if (lan) return inetAddress.getHostAddress();
+                        if (fallback == null) fallback = inetAddress.getHostAddress();
                     }
                 }
             }
         } catch (Exception ex) { ex.printStackTrace(); }
-        return "Unavailable";
+        return fallback != null ? fallback : "Unavailable";
     }
 
     // --- QR PAIRING ---
@@ -696,7 +734,8 @@ public class MainActivity extends AppCompatActivity {
                 try (Socket socket = new Socket()) {
                     socket.connect(new InetSocketAddress(ip, PairingQr.PORT), 1500);
                     DataOutputStream out = new DataOutputStream(socket.getOutputStream());
-                    byte[] nameBytes = phoneName.getBytes("UTF-8");
+                    // "name\nid": the id lets the desktop follow this phone when its IP changes
+                    byte[] nameBytes = (phoneName + "\n" + getOrCreateDeviceId()).getBytes("UTF-8");
                     out.writeInt(TYPE_PAIR);
                     out.writeInt(nameBytes.length);
                     out.write(nameBytes);
@@ -711,14 +750,18 @@ public class MainActivity extends AppCompatActivity {
             final String ip = connectedIp;
             final String error = lastError;
             new Handler(Looper.getMainLooper()).post(() -> {
-                if (ip != null) onPaired(info.desktopName, ip, pairStartedAt);
+                if (ip != null) onPaired(info, ip, pairStartedAt);
                 else showPairingFailed(info, error);
             });
         }).start();
     }
 
-    private void onPaired(String desktopName, String ip, long pairStartedAt) {
-        addOrUpdateDevice(desktopName, ip);
+    private void onPaired(PairingQr.Info info, String ip, long pairStartedAt) {
+        final String desktopName = info.desktopName;
+        DeviceInfo.upsertPaired(savedDevices, desktopName, ip, info.desktopId);
+        saveDevices();
+        if (deviceListLayout != null) refreshDeviceListUI();
+        LanPresence.poke(); // Announce ourselves right away
 
         if (lastPairAckTime >= pairStartedAt) {
             // The desktop's confirmation already arrived
@@ -777,28 +820,48 @@ public class MainActivity extends AppCompatActivity {
                 .show();
     }
 
-    // Saves the desktop as a send target (updating it instead of adding a duplicate)
-    private void addOrUpdateDevice(String name, String ip) {
-        DeviceInfo match = null;
-        for (DeviceInfo d : savedDevices) {
-            if (d.ip.equals(ip)) { match = d; break; } // Same address: keep the user's name for it
-        }
-        if (match == null) {
-            for (DeviceInfo d : savedDevices) {
-                if (d.name.equalsIgnoreCase(name)) { // Same desktop, new address (e.g. DHCP changed it)
-                    match = d;
-                    match.ip = ip;
-                    break;
-                }
+    // A saved desktop announced itself: update its IP if it moved (main thread)
+    private static void handleDesktopSeen(String id, String name, String ip) {
+        Context ctx = appContext;
+        if (ctx == null) return;
+        MainActivity live = liveInstance;
+        SharedPreferences p = ctx.getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        List<DeviceInfo> devices = live != null ? live.savedDevices : loadDeviceList(p);
+
+        DeviceInfo.SeenResult result = DeviceInfo.applyDesktopSeen(devices, id, name, ip);
+        if (result == null) return; // Unknown desktop, or nothing changed
+
+        saveDeviceList(p, devices);
+        if (live != null && live.deviceListLayout != null) live.refreshDeviceListUI();
+        if (result.oldIp != null) {
+            LanPresence.poke(); // Make sure the desktop has our current address too
+            if (live != null) {
+                Toast.makeText(live, result.device.name + " found at new IP " + ip + " - reconnected", Toast.LENGTH_SHORT).show();
             }
         }
-        if (match != null) {
-            match.selected = true;
-        } else {
-            savedDevices.add(new DeviceInfo(name, ip));
+    }
+
+    // Permanent random id for this phone, so desktops recognise it at any IP
+    private String getOrCreateDeviceId() {
+        String id = prefs.getString("DeviceId", null);
+        if (!DeviceInfo.isValidId(id)) {
+            id = java.util.UUID.randomUUID().toString().replace("-", "").substring(0, 12);
+            prefs.edit().putString("DeviceId", id).apply();
         }
-        saveDevices();
-        if (deviceListLayout != null) refreshDeviceListUI();
+        return id;
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
+        LanPresence.setForeground(true);
+        if (myIpTextView != null) myIpTextView.setText("My IP: " + getLocalIpAddress());
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        LanPresence.setForeground(false);
     }
 
     private String getPhoneName() {
