@@ -63,7 +63,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Full-screen camera that scans the desktop's pairing QR code and returns its content.
+ * Full-screen camera that scans a pairing QR code (desktop or phone) and returns its content.
  *
  * Tuned for speed:
  *  - ML Kit's on-device (bundled) model, so there is no model download and the first scan is instant
@@ -76,7 +76,7 @@ public class QrScanActivity extends AppCompatActivity {
 
     public static final String EXTRA_QR_PAYLOAD = "qr_payload";
 
-    private static final String DEFAULT_HINT = "Point your camera at the QR code on your computer";
+    private static final String DEFAULT_HINT = "Point your camera at a Clipboard Sync QR code (on a computer or another phone)";
 
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     private final AtomicBoolean handled = new AtomicBoolean(false);

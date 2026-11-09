@@ -50,7 +50,7 @@
         <activity
             android:name=".QrScanActivity"
             android:exported="false"
-            android:label="Scan Desktop QR Code" />
+            android:label="Scan QR Code" />
 
     </application>
 
