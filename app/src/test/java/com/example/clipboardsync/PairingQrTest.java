@@ -18,28 +18,55 @@ public class PairingQrTest {
     public void parsesDesktopPayload() {
         PairingQr.Info info = PairingQr.parse("clipsync://pair?v=1&n=MY%20PC&ip=192.168.1.23,10.0.0.5");
         assertNotNull(info);
-        assertEquals("MY PC", info.desktopName);
+        assertEquals("MY PC", info.name);
         assertEquals(Arrays.asList("192.168.1.23", "10.0.0.5"), info.ips);
     }
 
     @Test
     public void readsDesktopIdWhenPresent() {
-        assertEquals("076c24fa828f", PairingQr.parse("clipsync://pair?v=1&n=PC&id=076c24fa828f&ip=192.168.1.2").desktopId);
-        assertNull(PairingQr.parse("clipsync://pair?v=1&n=PC&ip=192.168.1.2").desktopId);
-        assertNull(PairingQr.parse("clipsync://pair?v=1&n=PC&id=bad%20id&ip=192.168.1.2").desktopId);
+        assertEquals("076c24fa828f", PairingQr.parse("clipsync://pair?v=1&n=PC&id=076c24fa828f&ip=192.168.1.2").id);
+        assertNull(PairingQr.parse("clipsync://pair?v=1&n=PC&ip=192.168.1.2").id);
+        assertNull(PairingQr.parse("clipsync://pair?v=1&n=PC&id=bad%20id&ip=192.168.1.2").id);
+    }
+
+    @Test
+    public void desktopCodesAreNotPhones() {
+        assertFalse(PairingQr.parse("clipsync://pair?v=1&n=PC&ip=192.168.1.2").isPhone);
+    }
+
+    @Test
+    public void phonePayloadRoundTrips() {
+        String payload = PairingQr.buildPhonePayload("Isaac's Galaxy S23", "phone123abc",
+                Arrays.asList("192.168.1.40", "10.0.0.8"));
+        assertEquals("clipsync://pair?v=1&r=p&n=Isaac%27s%20Galaxy%20S23&id=phone123abc&ip=192.168.1.40,10.0.0.8", payload);
+        PairingQr.Info info = PairingQr.parse(payload);
+        assertNotNull(info);
+        assertTrue(info.isPhone);
+        assertEquals("Isaac's Galaxy S23", info.name);
+        assertEquals("phone123abc", info.id);
+        assertEquals(Arrays.asList("192.168.1.40", "10.0.0.8"), info.ips);
+    }
+
+    @Test
+    public void phonePayloadCleansNameAndSkipsBadId() {
+        PairingQr.Info info = PairingQr.parse(PairingQr.buildPhonePayload("a|b & c", "bad id", Arrays.asList("192.168.1.40")));
+        assertNotNull(info);
+        assertEquals("a-b & c", info.name);
+        assertNull(info.id);
+        assertEquals("Phone", PairingQr.parse(PairingQr.buildPhonePayload("  ", null, Arrays.asList("192.168.1.40"))).name);
     }
 
     @Test
     public void decodesUnicodeAndPlusInName() {
         PairingQr.Info info = PairingQr.parse("clipsync://pair?v=1&n=Caf%C3%A9+PC&ip=192.168.0.2");
         assertNotNull(info);
-        assertEquals("Café PC", info.desktopName);
+        assertEquals("Café PC", info.name);
     }
 
     @Test
     public void defaultsNameAndStripsSeparator() {
-        assertEquals("Desktop", PairingQr.parse("clipsync://pair?ip=192.168.0.2").desktopName);
-        assertEquals("a-b", PairingQr.parse("clipsync://pair?n=a%7Cb&ip=192.168.0.2").desktopName);
+        assertEquals("Desktop", PairingQr.parse("clipsync://pair?ip=192.168.0.2").name);
+        assertEquals("a-b", PairingQr.parse("clipsync://pair?n=a%7Cb&ip=192.168.0.2").name);
     }
 
     @Test
@@ -64,7 +91,7 @@ public class PairingQrTest {
     public void malformedNameStillPairs() {
         PairingQr.Info info = PairingQr.parse("clipsync://pair?n=%ZZ&ip=192.168.1.5");
         assertNotNull(info);
-        assertEquals("Desktop", info.desktopName);
+        assertEquals("Desktop", info.name);
     }
 
     @Test

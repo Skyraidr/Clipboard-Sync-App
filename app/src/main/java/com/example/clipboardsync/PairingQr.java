@@ -1,15 +1,17 @@
 package com.example.clipboardsync;
 
 import java.net.URLDecoder;
+import java.net.URLEncoder;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 
 /**
- * Parses the pairing QR code shown by the Clipboard Sync desktop app.
+ * Builds and parses Clipboard Sync pairing QR codes (shown by the desktop app and by phones).
  *
- * Format: clipsync://pair?v=1&n=<url-encoded desktop name>&id=<desktop id>&ip=<ip1>,<ip2>,...
- * (id is optional: desktops without auto-reconnect don't send it)
+ * Format: clipsync://pair?v=1[&r=p]&n=<url-encoded name>&id=<device id>&ip=<ip1>,<ip2>,...
+ *  - r=p marks a phone's code; desktop codes have no r
+ *  - id is optional: desktops without auto-reconnect don't send it
  *
  * Plain Java (no Android classes) so it can be used from the camera thread and unit tested.
  */
@@ -21,13 +23,15 @@ public final class PairingQr {
     private PairingQr() { }
 
     public static final class Info {
-        public final String desktopName;
-        public final String desktopId; // null if the desktop didn't include one
+        public final String name;
+        public final String id;        // null if the code didn't include one
+        public final boolean isPhone;  // false = desktop
         public final List<String> ips;
 
-        Info(String desktopName, String desktopId, List<String> ips) {
-            this.desktopName = desktopName;
-            this.desktopId = desktopId;
+        Info(String name, String id, boolean isPhone, List<String> ips) {
+            this.name = name;
+            this.id = id;
+            this.isPhone = isPhone;
             this.ips = ips;
         }
     }
@@ -45,6 +49,7 @@ public final class PairingQr {
 
         String name = null;
         String id = null;
+        boolean isPhone = false;
         List<String> ips = new ArrayList<>();
         for (String param : s.substring(prefixLen + 1).split("&")) {
             int eq = param.indexOf('=');
@@ -55,6 +60,8 @@ public final class PairingQr {
 
             if (key.equals("n")) {
                 name = value;
+            } else if (key.equals("r")) {
+                isPhone = value.equals("p");
             } else if (key.equals("id")) {
                 id = DeviceInfo.isValidId(value) ? value : null;
             } else if (key.equals("ip")) {
@@ -65,7 +72,26 @@ public final class PairingQr {
             }
         }
         if (ips.isEmpty()) return null;
-        return new Info(cleanName(name), id, Collections.unmodifiableList(ips));
+        return new Info(cleanName(name, isPhone), id, isPhone, Collections.unmodifiableList(ips));
+    }
+
+    /** The content of this phone's own pairing QR code. */
+    public static String buildPhonePayload(String name, String id, List<String> ips) {
+        String encodedName;
+        try {
+            // Spaces as %20 (not '+') so every URI decoder reads the name the same way
+            encodedName = URLEncoder.encode(cleanName(name, true), "UTF-8").replace("+", "%20");
+        } catch (Exception e) {
+            encodedName = "Phone";
+        }
+        StringBuilder sb = new StringBuilder(PREFIX).append("?v=1&r=p&n=").append(encodedName);
+        if (DeviceInfo.isValidId(id)) sb.append("&id=").append(id);
+        sb.append("&ip=");
+        for (int i = 0; i < ips.size(); i++) {
+            if (i > 0) sb.append(',');
+            sb.append(ips.get(i));
+        }
+        return sb.toString();
     }
 
     /**
@@ -108,11 +134,12 @@ public final class PairingQr {
         return ip.substring(0, ip.lastIndexOf('.') + 1);
     }
 
-    private static String cleanName(String name) {
-        if (name == null) return "Desktop";
+    private static String cleanName(String name, boolean isPhone) {
+        String fallback = isPhone ? "Phone" : "Desktop";
+        if (name == null) return fallback;
         // '|' is the separator used when saving devices, so it can't appear in a name
         String cleaned = name.replaceAll("\\p{Cntrl}", "").replace('|', '-').trim();
-        if (cleaned.isEmpty()) return "Desktop";
+        if (cleaned.isEmpty()) return fallback;
         return cleaned.length() > 40 ? cleaned.substring(0, 40) : cleaned;
     }
 

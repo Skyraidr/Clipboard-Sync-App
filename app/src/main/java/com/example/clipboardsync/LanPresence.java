@@ -27,7 +27,7 @@ import java.util.Set;
  *
  *  - Announces this phone on UDP port 8889 every 3s while the app is open (every 30s in the background),
  *    and immediately whenever Wi-Fi connects or the phone's address changes.
- *  - Listens for desktop announcements and reports them, so saved desktop IPs can be updated.
+ *  - Listens for announcements from desktops and other phones, so saved device IPs can be updated.
  *
  * One instance per app process (like the TCP receiver on port 8888).
  */
@@ -38,14 +38,14 @@ final class LanPresence {
     private static final long BACKGROUND_INTERVAL_MS = 30000;
 
     interface Listener {
-        /** A desktop announced itself (called on a background thread). */
-        void onDesktopSeen(String id, String name, String ip);
+        /** A desktop or another phone announced itself (called on a background thread). */
+        void onPeerSeen(String id, String name, String ip);
 
         /** This phone's own IP addresses changed (called on a background thread). */
         void onLocalAddressesChanged();
 
-        /** Saved desktop IPs: announcements are also sent straight to them in case broadcasts are filtered. */
-        List<String> knownDesktopIps();
+        /** Saved device IPs: announcements are also sent straight to them in case broadcasts are filtered. */
+        List<String> knownDeviceIps();
     }
 
     private static LanPresence instance;
@@ -201,7 +201,7 @@ final class LanPresence {
         try {
             targets.add(InetAddress.getByName("255.255.255.255"));
         } catch (Exception ignored) { }
-        for (String ip : listener.knownDesktopIps()) {
+        for (String ip : listener.knownDeviceIps()) {
             // Only plain IPv4 addresses (a typed hostname would mean a DNS lookup on every announcement)
             if (!PairingQr.isValidIpv4(ip)) continue;
             try {
@@ -231,8 +231,8 @@ final class LanPresence {
                 if (!(packet.getAddress() instanceof Inet4Address)) continue;
                 PresenceMessage msg = PresenceMessage.parse(
                         new String(packet.getData(), packet.getOffset(), packet.getLength(), StandardCharsets.UTF_8));
-                if (msg == null || msg.role != PresenceMessage.ROLE_DESKTOP || msg.id.equals(myId)) continue;
-                listener.onDesktopSeen(msg.id, msg.name, packet.getAddress().getHostAddress());
+                if (msg == null || msg.id.equals(myId)) continue;
+                listener.onPeerSeen(msg.id, msg.name, packet.getAddress().getHostAddress());
             } catch (Exception ignored) { }
         }
     }

@@ -34,19 +34,19 @@ public class DeviceInfoTest {
     public void followsKnownDesktopToNewIp() {
         List<DeviceInfo> list = new ArrayList<>();
         list.add(new DeviceInfo("Laptop", "192.168.1.2", "desk1"));
-        DeviceInfo.SeenResult r = DeviceInfo.applyDesktopSeen(list, "desk1", "DESKTOP-X", "192.168.1.9");
+        DeviceInfo.SeenResult r = DeviceInfo.applyPeerSeen(list, "desk1", "DESKTOP-X", "192.168.1.9");
         assertNotNull(r);
         assertEquals("192.168.1.2", r.oldIp);
         assertEquals("192.168.1.9", list.get(0).ip);
         assertEquals("Laptop", list.get(0).name); // user's name kept
-        assertNull(DeviceInfo.applyDesktopSeen(list, "desk1", "DESKTOP-X", "192.168.1.9")); // no change
+        assertNull(DeviceInfo.applyPeerSeen(list, "desk1", "DESKTOP-X", "192.168.1.9")); // no change
     }
 
     @Test
     public void learnsIdForManuallyAddedDeviceAtSameIp() {
         List<DeviceInfo> list = new ArrayList<>();
         list.add(new DeviceInfo("PC", "192.168.1.2"));
-        DeviceInfo.SeenResult r = DeviceInfo.applyDesktopSeen(list, "desk1", "DESKTOP-X", "192.168.1.2");
+        DeviceInfo.SeenResult r = DeviceInfo.applyPeerSeen(list, "desk1", "DESKTOP-X", "192.168.1.2");
         assertNotNull(r);
         assertNull(r.oldIp);
         assertEquals("desk1", list.get(0).id);
@@ -56,7 +56,7 @@ public class DeviceInfoTest {
     public void learnsIdByNameForDevicePairedBeforeIds() {
         List<DeviceInfo> list = new ArrayList<>();
         list.add(new DeviceInfo("DESKTOP-X", "192.168.1.2"));
-        DeviceInfo.SeenResult r = DeviceInfo.applyDesktopSeen(list, "desk1", "desktop-x", "10.0.0.7");
+        DeviceInfo.SeenResult r = DeviceInfo.applyPeerSeen(list, "desk1", "desktop-x", "10.0.0.7");
         assertNotNull(r);
         assertEquals("192.168.1.2", r.oldIp);
         assertEquals("10.0.0.7", list.get(0).ip);
@@ -67,8 +67,8 @@ public class DeviceInfoTest {
     public void ignoresUnknownDesktopsAndDevicesWithOtherIds() {
         List<DeviceInfo> list = new ArrayList<>();
         list.add(new DeviceInfo("DESKTOP-X", "192.168.1.2", "other"));
-        assertNull(DeviceInfo.applyDesktopSeen(list, "desk1", "DESKTOP-X", "192.168.1.2"));
-        assertNull(DeviceInfo.applyDesktopSeen(list, "bad id", "DESKTOP-X", "192.168.1.5"));
+        assertNull(DeviceInfo.applyPeerSeen(list, "desk1", "DESKTOP-X", "192.168.1.2"));
+        assertNull(DeviceInfo.applyPeerSeen(list, "bad id", "DESKTOP-X", "192.168.1.5"));
         assertEquals("192.168.1.2", list.get(0).ip);
         assertEquals("other", list.get(0).id);
     }

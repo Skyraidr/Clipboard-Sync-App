@@ -3,10 +3,10 @@ package com.example.clipboardsync;
 import java.util.List;
 
 /**
- * A saved target device (normally a desktop). Plain Java so the matching rules can be unit tested.
+ * A saved target device (a desktop or another phone). Plain Java so the matching rules can be unit tested.
  *
- * Saved as "name|ip" or "name|ip|id". The id is the desktop's permanent id: it comes from the QR code,
- * or is learned from the desktop's presence beacons, and lets us follow the desktop when its IP changes.
+ * Saved as "name|ip" or "name|ip|id". The id is the device's permanent id: it comes from the QR code or
+ * the pairing message, or is learned from presence beacons, and lets us follow the device when its IP changes.
  */
 final class DeviceInfo {
     private static final String ID_PATTERN = "[A-Za-z0-9_-]{1,64}";
@@ -43,10 +43,10 @@ final class DeviceInfo {
         return id != null && id.matches(ID_PATTERN);
     }
 
-    /** What changed when a desktop announced itself. */
+    /** What changed when a device announced itself. */
     static final class SeenResult {
         final DeviceInfo device;
-        final String oldIp; // Non-null when the desktop moved to a new IP
+        final String oldIp; // Non-null when the device moved to a new IP
 
         SeenResult(DeviceInfo device, String oldIp) {
             this.device = device;
@@ -55,10 +55,10 @@ final class DeviceInfo {
     }
 
     /**
-     * A desktop announced (id, name) at ip. Updates the matching saved device in place.
-     * Returns what changed (so the caller can save), or null if nothing did / the desktop isn't saved.
+     * A device announced (id, name) at ip. Updates the matching saved device in place.
+     * Returns what changed (so the caller can save), or null if nothing did / the device isn't saved.
      */
-    static SeenResult applyDesktopSeen(List<DeviceInfo> devices, String id, String name, String ip) {
+    static SeenResult applyPeerSeen(List<DeviceInfo> devices, String id, String name, String ip) {
         if (!isValidId(id) || ip == null) return null;
 
         // 1. Known by id: follow it to its new address
@@ -91,7 +91,7 @@ final class DeviceInfo {
     }
 
     /**
-     * Saves a desktop we just paired with by QR code, updating an existing entry instead of adding a duplicate.
+     * Saves a device we just paired with by QR code, updating an existing entry instead of adding a duplicate.
      * An entry matched by id or address keeps the name the user gave it.
      */
     static DeviceInfo upsertPaired(List<DeviceInfo> devices, String name, String ip, String id) {

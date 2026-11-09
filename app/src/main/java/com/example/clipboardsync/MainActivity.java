@@ -13,6 +13,7 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.net.Uri;
 import android.os.Build;
@@ -27,6 +28,7 @@ import android.view.ViewGroup;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.EditText;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
@@ -38,6 +40,9 @@ import androidx.camera.lifecycle.ProcessCameraProvider;
 import androidx.core.app.ActivityCompat;
 import androidx.core.content.ContextCompat;
 import android.app.AlertDialog;
+import android.view.Window;
+import android.view.WindowManager;
+import io.nayuki.qrcodegen.QrCode;
 
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
@@ -75,6 +80,11 @@ public class MainActivity extends AppCompatActivity {
     private Button manualSendBtn;
 
     private static final String PREFS_NAME = "AppPrefs";
+
+    // This phone's own pairing QR code (shown so another phone can scan it)
+    private AlertDialog myQrDialog;
+    private ImageView myQrImage;
+    private TextView myQrInfo;
     private SharedPreferences prefs;
 
     // Thread-safe: read by background send threads while the UI may add/remove devices
@@ -96,8 +106,8 @@ public class MainActivity extends AppCompatActivity {
 
     private static final LanPresence.Listener PRESENCE_LISTENER = new LanPresence.Listener() {
         @Override
-        public void onDesktopSeen(String id, String name, String ip) {
-            new Handler(Looper.getMainLooper()).post(() -> handleDesktopSeen(id, name, ip));
+        public void onPeerSeen(String id, String name, String ip) {
+            new Handler(Looper.getMainLooper()).post(() -> handlePeerSeen(id, name, ip));
         }
 
         @Override
@@ -107,11 +117,12 @@ public class MainActivity extends AppCompatActivity {
                 if (live != null && live.myIpTextView != null) {
                     live.myIpTextView.setText("My IP: " + live.getLocalIpAddress());
                 }
+                if (live != null) live.updateMyQrCode(); // Keep an open QR code pointing at our current IP
             });
         }
 
         @Override
-        public List<String> knownDesktopIps() {
+        public List<String> knownDeviceIps() {
             List<String> ips = new ArrayList<>();
             Context ctx = appContext;
             if (ctx == null) return ips;
@@ -128,7 +139,11 @@ public class MainActivity extends AppCompatActivity {
                     Toast.makeText(this, "Not a Clipboard Sync QR code", Toast.LENGTH_SHORT).show();
                     return;
                 }
-                connectToDesktop(info);
+                if (getOrCreateDeviceId().equals(info.id)) {
+                    Toast.makeText(this, "That's this phone's own QR code - scan it with the other device", Toast.LENGTH_LONG).show();
+                    return;
+                }
+                connectToPeer(info);
             });
 
 
@@ -198,12 +213,20 @@ public class MainActivity extends AppCompatActivity {
 
         // --- QR PAIRING ---
         Button scanQrBtn = new Button(this);
-        scanQrBtn.setText("📷 SCAN DESKTOP QR CODE");
+        scanQrBtn.setText("📷 SCAN QR CODE");
         scanQrBtn.setLayoutParams(new LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT
         ));
         scanQrBtn.setOnClickListener(v -> qrScanLauncher.launch(new Intent(this, QrScanActivity.class)));
+
+        Button showQrBtn = new Button(this);
+        showQrBtn.setText("🔳 SHOW MY QR CODE");
+        showQrBtn.setLayoutParams(new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        ));
+        showQrBtn.setOnClickListener(v -> showMyQrCode());
 
         // --- ADD DEVICE SECTION ---
         TextView addLabel = new TextView(this);
@@ -260,6 +283,7 @@ public class MainActivity extends AppCompatActivity {
         layout.addView(statusTextView);
         layout.addView(myIpTextView);
         layout.addView(scanQrBtn);
+        layout.addView(showQrBtn);
         layout.addView(createSpacer(dpToPx(20)));
         layout.addView(addLabel);
         layout.addView(addLayout);
@@ -552,14 +576,26 @@ public class MainActivity extends AppCompatActivity {
             in.readFully(buffer);
 
             // Process data (Background Thread)
-            if (type == TYPE_PAIR_ACK) { // Desktop confirmed it can reach us -> connected both ways
-                String desktopName = new String(buffer, "UTF-8");
+            if (type == TYPE_PAIR_ACK) { // The device we paired with confirmed it can reach us -> connected both ways
+                String peerName = new String(buffer, "UTF-8");
                 lastPairAckTime = SystemClock.elapsedRealtime();
                 new Handler(Looper.getMainLooper()).post(() -> {
                     MainActivity live = liveInstance;
-                    if (live != null) live.showPairConfirmed(desktopName);
-                    else Toast.makeText(getApplicationContext(), "Connected both ways with " + desktopName, Toast.LENGTH_SHORT).show();
+                    if (live != null) live.showPairConfirmed(peerName);
+                    else Toast.makeText(getApplicationContext(), "Connected both ways with " + peerName, Toast.LENGTH_SHORT).show();
                 });
+            }
+            else if (type == TYPE_PAIR) { // Another phone scanned OUR QR code. Data = "name\nid"
+                String[] parts = new String(buffer, "UTF-8").split("\n", 2);
+                String peerName = PresenceMessage.cleanName(parts[0], "Phone");
+                String peerId = parts.length > 1 ? parts[1].trim() : null;
+                String peerIp = socket.getInetAddress().getHostAddress();
+                if (!PairingQr.isValidIpv4(peerIp) || getOrCreateDeviceId().equals(peerId)) return;
+
+                new Handler(Looper.getMainLooper()).post(() -> handlePairFromPhone(peerName, peerIp, peerId));
+                // Confirm on a new connection, exactly like the desktop does (proves we can reach them too)
+                final String myName = getPhoneName();
+                new Thread(() -> sendPairAck(peerIp, myName)).start();
             }
             else if (type == 1) { // Text
                 String text = new String(buffer);
@@ -715,15 +751,15 @@ public class MainActivity extends AppCompatActivity {
 
     // --- QR PAIRING ---
 
-    // Tells the desktop who we are. Once the desktop receives this it sends to this phone,
-    // and the desktop is saved here as a target, so clipboard sync works in both directions.
-    private void connectToDesktop(PairingQr.Info info) {
+    // Tells the scanned device (desktop or phone) who we are. Once it receives this it sends to this
+    // phone, and it is saved here as a target, so clipboard sync works in both directions.
+    private void connectToPeer(PairingQr.Info info) {
         final String phoneName = getPhoneName();
         final List<String> tryOrder = PairingQr.prioritizeSameSubnet(info.ips, getAllLocalIpv4());
         final long pairStartedAt = SystemClock.elapsedRealtime();
 
         if (statusTextView != null) {
-            statusTextView.setText("Connecting to " + info.desktopName + "...");
+            statusTextView.setText("Connecting to " + info.name + "...");
             statusTextView.setTextColor(Color.YELLOW);
         }
 
@@ -734,7 +770,7 @@ public class MainActivity extends AppCompatActivity {
                 try (Socket socket = new Socket()) {
                     socket.connect(new InetSocketAddress(ip, PairingQr.PORT), 1500);
                     DataOutputStream out = new DataOutputStream(socket.getOutputStream());
-                    // "name\nid": the id lets the desktop follow this phone when its IP changes
+                    // "name\nid": the id lets the other device follow this phone when its IP changes
                     byte[] nameBytes = (phoneName + "\n" + getOrCreateDeviceId()).getBytes("UTF-8");
                     out.writeInt(TYPE_PAIR);
                     out.writeInt(nameBytes.length);
@@ -757,35 +793,35 @@ public class MainActivity extends AppCompatActivity {
     }
 
     private void onPaired(PairingQr.Info info, String ip, long pairStartedAt) {
-        final String desktopName = info.desktopName;
-        DeviceInfo.upsertPaired(savedDevices, desktopName, ip, info.desktopId);
+        final String peerName = info.name;
+        DeviceInfo.upsertPaired(savedDevices, peerName, ip, info.id);
         saveDevices();
         if (deviceListLayout != null) refreshDeviceListUI();
         LanPresence.poke(); // Announce ourselves right away
 
         if (lastPairAckTime >= pairStartedAt) {
-            // The desktop's confirmation already arrived
-            showPairConfirmed(desktopName);
+            // The other device's confirmation already arrived
+            showPairConfirmed(peerName);
         } else {
             if (statusTextView != null) {
-                statusTextView.setText("Connected to " + desktopName + " - confirming...");
+                statusTextView.setText("Connected to " + peerName + " - confirming...");
                 statusTextView.setTextColor(Color.YELLOW);
             }
-            Toast.makeText(this, "Connected to " + desktopName, Toast.LENGTH_SHORT).show();
+            Toast.makeText(this, "Connected to " + peerName, Toast.LENGTH_SHORT).show();
         }
 
-        // If the desktop can't reach us back, sync would only work one way - tell the user why
+        // If the other device can't reach us back, sync would only work one way - tell the user why
         new Handler(Looper.getMainLooper()).postDelayed(() -> {
             if (lastPairAckTime >= pairStartedAt) return;
             MainActivity live = liveInstance;
             if (live == null || live.isFinishing() || live.isDestroyed()) return;
             if (live.statusTextView != null) {
-                live.statusTextView.setText("Connected to " + desktopName + " (one way only)");
+                live.statusTextView.setText("Connected to " + peerName + " (one way only)");
                 live.statusTextView.setTextColor(Color.parseColor("#FFA500"));
             }
             new AlertDialog.Builder(live)
                     .setTitle("Almost connected")
-                    .setMessage("This phone can send to " + desktopName + ", but " + desktopName
+                    .setMessage("This phone can send to " + peerName + ", but " + peerName
                             + " could not reach this phone.\n\n"
                             + "• Keep Clipboard Sync open on this phone\n"
                             + "• Make sure both devices are on the same Wi-Fi\n"
@@ -795,53 +831,194 @@ public class MainActivity extends AppCompatActivity {
         }, 5000);
     }
 
-    private void showPairConfirmed(String desktopName) {
+    private void showPairConfirmed(String peerName) {
         if (statusTextView != null) {
-            statusTextView.setText("✅ Connected both ways with " + desktopName);
+            statusTextView.setText("✅ Connected both ways with " + peerName);
             statusTextView.setTextColor(Color.GREEN);
         }
-        Toast.makeText(this, "Connected both ways with " + desktopName + "!", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, "Connected both ways with " + peerName + "!", Toast.LENGTH_SHORT).show();
     }
 
     private void showPairingFailed(PairingQr.Info info, String error) {
         if (statusTextView != null) {
-            statusTextView.setText("Could not connect to " + info.desktopName);
+            statusTextView.setText("Could not connect to " + info.name);
             statusTextView.setTextColor(Color.RED);
         }
         if (isFinishing() || isDestroyed()) return;
         new AlertDialog.Builder(this)
                 .setTitle("Could not connect")
-                .setMessage("Could not reach " + info.desktopName + " at " + String.join(", ", info.ips)
+                .setMessage("Could not reach " + info.name + " at " + String.join(", ", info.ips)
                         + (error != null ? "\n\n(" + error + ")" : "") + "\n\n"
-                        + "• Make sure the desktop app is running\n"
-                        + "• Connect both devices to the same Wi-Fi\n"
-                        + "• Allow Java through the PC's firewall (port 8888)")
+                        + (info.isPhone
+                            ? "• Keep Clipboard Sync open on the other phone\n"
+                              + "• Connect both phones to the same Wi-Fi\n"
+                              + "• Some guest/public Wi-Fi networks block device-to-device traffic"
+                            : "• Make sure the desktop app is running\n"
+                              + "• Connect both devices to the same Wi-Fi\n"
+                              + "• Allow Java through the PC's firewall (port 8888)"))
                 .setPositiveButton("OK", null)
                 .show();
     }
 
-    // A saved desktop announced itself: update its IP if it moved (main thread)
-    private static void handleDesktopSeen(String id, String name, String ip) {
+    // A saved device (desktop or phone) announced itself: update its IP if it moved (main thread)
+    private static void handlePeerSeen(String id, String name, String ip) {
         Context ctx = appContext;
         if (ctx == null) return;
         MainActivity live = liveInstance;
         SharedPreferences p = ctx.getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         List<DeviceInfo> devices = live != null ? live.savedDevices : loadDeviceList(p);
 
-        DeviceInfo.SeenResult result = DeviceInfo.applyDesktopSeen(devices, id, name, ip);
-        if (result == null) return; // Unknown desktop, or nothing changed
+        DeviceInfo.SeenResult result = DeviceInfo.applyPeerSeen(devices, id, name, ip);
+        if (result == null) return; // Unknown device, or nothing changed
 
         saveDeviceList(p, devices);
         if (live != null && live.deviceListLayout != null) live.refreshDeviceListUI();
         if (result.oldIp != null) {
-            LanPresence.poke(); // Make sure the desktop has our current address too
+            LanPresence.poke(); // Make sure it has our current address too
             if (live != null) {
                 Toast.makeText(live, result.device.name + " found at new IP " + ip + " - reconnected", Toast.LENGTH_SHORT).show();
             }
         }
     }
 
-    // Permanent random id for this phone, so desktops recognise it at any IP
+    // Another phone scanned our QR code: save it as a target (main thread)
+    private static void handlePairFromPhone(String name, String ip, String id) {
+        Context ctx = appContext;
+        if (ctx == null) return;
+        MainActivity live = liveInstance;
+        SharedPreferences p = ctx.getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
+        List<DeviceInfo> devices = live != null ? live.savedDevices : loadDeviceList(p);
+
+        DeviceInfo.upsertPaired(devices, name, ip, id);
+        saveDeviceList(p, devices);
+        if (live != null) {
+            if (live.deviceListLayout != null) live.refreshDeviceListUI();
+            if (live.myQrDialog != null) live.myQrDialog.dismiss(); // Done - no need to keep showing the code
+            if (live.statusTextView != null) {
+                live.statusTextView.setText("✅ Paired with " + name);
+                live.statusTextView.setTextColor(Color.GREEN);
+            }
+        }
+        Toast.makeText(ctx, "Paired with " + name + "!", Toast.LENGTH_SHORT).show();
+        LanPresence.poke();
+    }
+
+    private void sendPairAck(String ip, String myName) {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress(ip, PairingQr.PORT), 3000);
+            DataOutputStream out = new DataOutputStream(socket.getOutputStream());
+            byte[] nameBytes = myName.getBytes("UTF-8");
+            out.writeInt(TYPE_PAIR_ACK);
+            out.writeInt(nameBytes.length);
+            out.write(nameBytes);
+            out.flush();
+        } catch (Exception e) {
+            e.printStackTrace(); // The scanning phone will explain the one-way connection
+        }
+    }
+
+    // --- MY QR CODE ---
+
+    private void showMyQrCode() {
+        if (getPairingIps().isEmpty()) {
+            Toast.makeText(this, "Connect to Wi-Fi first", Toast.LENGTH_SHORT).show();
+            return;
+        }
+        if (myQrDialog != null) return; // Already showing
+
+        LinearLayout box = new LinearLayout(this);
+        box.setOrientation(LinearLayout.VERTICAL);
+        box.setGravity(Gravity.CENTER_HORIZONTAL);
+        int pad = dpToPx(16);
+        box.setPadding(pad, pad, pad, pad);
+
+        myQrImage = new ImageView(this);
+        myQrImage.setAdjustViewBounds(true);
+        box.addView(myQrImage, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+
+        myQrInfo = new TextView(this);
+        myQrInfo.setGravity(Gravity.CENTER);
+        myQrInfo.setPadding(0, dpToPx(12), 0, 0);
+        box.addView(myQrInfo);
+
+        myQrDialog = new AlertDialog.Builder(this)
+                .setTitle("Scan to connect")
+                .setView(box)
+                .setPositiveButton("Done", null)
+                .create();
+        myQrDialog.setOnDismissListener(d -> {
+            myQrDialog = null;
+            myQrImage = null;
+            myQrInfo = null;
+        });
+
+        updateMyQrCode();
+        myQrDialog.show();
+
+        // Full brightness makes the code much quicker to scan, like payment QR codes
+        Window window = myQrDialog.getWindow();
+        if (window != null) {
+            WindowManager.LayoutParams lp = window.getAttributes();
+            lp.screenBrightness = 1f;
+            window.setAttributes(lp);
+        }
+    }
+
+    // Redraws the open QR code with this phone's current IPs (no-op when it isn't showing)
+    private void updateMyQrCode() {
+        if (myQrImage == null || myQrInfo == null) return;
+        List<String> ips = getPairingIps();
+        if (ips.isEmpty()) {
+            myQrImage.setImageBitmap(null);
+            myQrInfo.setText("Not connected to Wi-Fi.\nConnect, and the code appears here automatically.");
+            return;
+        }
+        String name = getPhoneName();
+        QrCode qr = QrCode.encodeText(PairingQr.buildPhonePayload(name, getOrCreateDeviceId(), ips), QrCode.Ecc.MEDIUM);
+        myQrImage.setImageBitmap(renderQrCode(qr, dpToPx(240)));
+        myQrInfo.setText(name + "\n" + String.join(", ", ips)
+                + "\n\nOn the other phone: open Clipboard Sync and tap Scan QR Code");
+    }
+
+    private static Bitmap renderQrCode(QrCode qr, int targetPx) {
+        int border = 4; // Quiet zone required by the QR spec (also keeps it readable on a dark dialog)
+        int modules = qr.size + border * 2;
+        int scale = Math.max(1, targetPx / modules);
+        int px = modules * scale;
+        int[] pixels = new int[px * px];
+        for (int y = 0; y < px; y++) {
+            for (int x = 0; x < px; x++) {
+                pixels[y * px + x] = qr.getModule(x / scale - border, y / scale - border) ? Color.BLACK : Color.WHITE;
+            }
+        }
+        return Bitmap.createBitmap(pixels, px, px, Bitmap.Config.ARGB_8888);
+    }
+
+    // Wi-Fi/Ethernet/hotspot addresses first (what another phone can reach), at most 4 to keep the code small
+    private static List<String> getPairingIps() {
+        List<String> lan = new ArrayList<>();
+        List<String> other = new ArrayList<>();
+        try {
+            for (Enumeration<NetworkInterface> en = NetworkInterface.getNetworkInterfaces(); en != null && en.hasMoreElements();) {
+                NetworkInterface intf = en.nextElement();
+                if (intf.isLoopback() || !intf.isUp()) continue;
+                String ifName = intf.getName() == null ? "" : intf.getName().toLowerCase(Locale.ROOT);
+                boolean isLan = ifName.startsWith("wlan") || ifName.startsWith("eth") || ifName.startsWith("swlan") || ifName.startsWith("ap");
+                for (Enumeration<InetAddress> addrs = intf.getInetAddresses(); addrs.hasMoreElements();) {
+                    InetAddress addr = addrs.nextElement();
+                    if (!(addr instanceof Inet4Address) || addr.isLoopbackAddress() || addr.isLinkLocalAddress()) continue;
+                    String ip = addr.getHostAddress();
+                    List<String> target = isLan ? lan : other;
+                    if (!lan.contains(ip) && !other.contains(ip)) target.add(ip);
+                }
+            }
+        } catch (Exception ignored) { }
+        List<String> result = lan.isEmpty() ? other : lan; // Mobile-data addresses are only a last resort
+        return result.size() > 4 ? new ArrayList<>(result.subList(0, 4)) : result;
+    }
+
+    // Permanent random id for this phone, so other devices recognise it at any IP
     private String getOrCreateDeviceId() {
         String id = prefs.getString("DeviceId", null);
         if (!DeviceInfo.isValidId(id)) {
@@ -928,7 +1105,7 @@ public class MainActivity extends AppCompatActivity {
         String type = intent.getType();
 
         if (savedDevices.isEmpty()) {
-            Toast.makeText(getApplicationContext(), "Add a device (or scan your desktop's QR code) in the app first!", Toast.LENGTH_LONG).show();
+            Toast.makeText(getApplicationContext(), "Add a device (or scan a QR code) in the app first!", Toast.LENGTH_LONG).show();
             return;
         }
 
